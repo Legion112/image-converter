@@ -4,7 +4,7 @@ Small Go utilities that take **photos or raster PDFs** and build **print-ready A
 
 ## Requirements
 
-- [Go](https://go.dev/) **1.23** or newer (pdfcpu needs 1.23+)
+- [Go](https://go.dev/) **1.26** or newer
 
 ## Build
 
