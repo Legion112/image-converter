@@ -15,7 +15,7 @@ import (
 
 	"github.com/go-pdf/fpdf"
 
-	"github.com/legion/image-converter/internal/pack"
+	"github.com/legion112/image-converter/internal/pack"
 )
 
 // IATA-style boarding pass print size (wide × tall in mm).

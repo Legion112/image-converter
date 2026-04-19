@@ -1,4 +1,4 @@
-module github.com/legion/image-converter
+module github.com/legion112/image-converter
 
 go 1.23.0
 
