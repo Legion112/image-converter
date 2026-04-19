@@ -2,6 +2,9 @@
 // (148 mm × 105 mm) as fit. Page orientation (portrait vs landscape) is chosen
 // automatically to maximize the count (typically 4 on A4 landscape with no margin).
 //
+// Input is either a directory of JPEG/PNG files or a single PDF; for PDFs, embedded
+// images are extracted (pdfcpu) in page order, then the same layout rules apply.
+//
 // Each bitmap is embedded at full resolution; only the PDF placement size in mm
 // changes (contain inside the A6 slot), so print resolution comes from the file.
 //
@@ -15,6 +18,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -23,9 +27,14 @@ import (
 
 	"github.com/disintegration/imaging"
 	"github.com/go-pdf/fpdf"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 )
 
-var exts = map[string]bool{".jpg": true, ".jpeg": true, ".png": true}
+var fileExts = map[string]bool{".jpg": true, ".jpeg": true, ".png": true}
 
 // ISO 216 A6 landscape: long edge horizontal.
 const (
@@ -35,23 +44,32 @@ const (
 	a4PortraitHMM  = 297.0
 )
 
+// sourceImage is one raster to place (from a file path or extracted from a PDF).
+type sourceImage struct {
+	label string // path or "file.pdf (page 2, Im1)"
+	raw   []byte
+	ext   string // lowercase, includes dot, e.g. ".jpg"
+}
+
 func main() {
-	inputDir := flag.String("input", "", "directory containing images (required)")
+	inputPath := flag.String("input", "", "directory of JPEG/PNG images, or a .pdf file (required)")
 	outputPath := flag.String("output", "", "output PDF path (required)")
 	marginMM := flag.Float64("margin", 0,
 		"symmetric page margin in mm; larger margins reduce how many physical A6 (148×105) tiles fit")
 	rotateEncode := flag.String("rotate-encode", "jpeg",
 		"for portrait files after rotation: jpeg (quality 100) or png (lossless from decoded pixels)")
+	pdfPages := flag.String("pdf-pages", "",
+		"when -input is a PDF: optional page selection (pdfcpu syntax), e.g. 1-3,5; default all pages")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s -input <dir> -output <file.pdf>\n\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "Usage: %s -input <dir|file.pdf> -output <file.pdf>\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr,
 			"Packs images into physical A6 landscape slots (148×105 mm) on A4, as many as fit.\n"+
-				"Chooses A4 portrait vs landscape to maximize slot count. Does not downsample pixels.\n\n")
+				"Input may be a folder of images or a PDF (embedded images extracted in page order).\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if *inputDir == "" || *outputPath == "" {
+	if *inputPath == "" || *outputPath == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -62,13 +80,13 @@ func main() {
 	}
 	usePNGRotate := re == "png"
 
-	paths, err := listImagePaths(*inputDir)
+	sources, err := loadSources(*inputPath, *pdfPages)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if len(paths) == 0 {
-		fmt.Fprintln(os.Stderr, "no supported images found in", *inputDir)
+	if len(sources) == 0 {
+		fmt.Fprintln(os.Stderr, "no images to process from", *inputPath)
 		os.Exit(1)
 	}
 
@@ -78,8 +96,8 @@ func main() {
 		os.Exit(1)
 	}
 	perPage := cols * rows
-	fmt.Fprintf(os.Stderr, "layout: A4 %s, %d×%d = %d A6 landscape slots (148×105 mm) per page, margin %.1f mm\n",
-		map[string]string{"L": "landscape", "P": "portrait"}[orient], cols, rows, perPage, *marginMM)
+	fmt.Fprintf(os.Stderr, "layout: A4 %s, %d×%d = %d A6 landscape slots (148×105 mm) per page, margin %.1f mm; %d source image(s)\n",
+		map[string]string{"L": "landscape", "P": "portrait"}[orient], cols, rows, perPage, *marginMM, len(sources))
 
 	pdf := fpdf.New(orient, "mm", "A4", "")
 
@@ -90,11 +108,11 @@ func main() {
 	offX := *marginMM + (innerW-totalW)/2
 	offY := *marginMM + (innerH-totalH)/2
 
-	for start := 0; start < len(paths); start += perPage {
+	for start := 0; start < len(sources); start += perPage {
 		pdf.AddPage()
 		end := start + perPage
-		if end > len(paths) {
-			end = len(paths)
+		if end > len(sources) {
+			end = len(sources)
 		}
 		for i := start; i < end; i++ {
 			slot := i - start
@@ -104,16 +122,16 @@ func main() {
 			frameY := offY + float64(row)*a6LandscapeHMM
 
 			name := fmt.Sprintf("img_%d", i)
-			imgType, payload, pw, ph, err := prepareForPDF(paths[i], usePNGRotate)
+			imgType, payload, pw, ph, err := preparePayload(sources[i].raw, sources[i].ext, usePNGRotate)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s: %v\n", paths[i], err)
+				fmt.Fprintf(os.Stderr, "%s: %v\n", sources[i].label, err)
 				os.Exit(1)
 			}
 
 			opt := fpdf.ImageOptions{ImageType: imgType, ReadDpi: false}
 			pdf.RegisterImageOptionsReader(name, opt, bytes.NewReader(payload))
 			if err := pdf.Error(); err != nil {
-				fmt.Fprintf(os.Stderr, "register %s: %v\n", paths[i], err)
+				fmt.Fprintf(os.Stderr, "register %s: %v\n", sources[i].label, err)
 				os.Exit(1)
 			}
 
@@ -132,7 +150,7 @@ func main() {
 
 			pdf.ImageOptions(name, x, y, drawW, drawH, false, opt, 0, "")
 			if err := pdf.Error(); err != nil {
-				fmt.Fprintf(os.Stderr, "place %s: %v\n", paths[i], err)
+				fmt.Fprintf(os.Stderr, "place %s: %v\n", sources[i].label, err)
 				os.Exit(1)
 			}
 		}
@@ -142,6 +160,101 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func loadSources(inputPath, pdfPages string) ([]sourceImage, error) {
+	fi, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, err
+	}
+	if fi.IsDir() {
+		return sourcesFromDir(inputPath)
+	}
+	if strings.EqualFold(filepath.Ext(inputPath), ".pdf") {
+		var sel []string
+		if strings.TrimSpace(pdfPages) != "" {
+			sel = []string{strings.TrimSpace(pdfPages)}
+		}
+		return sourcesFromPDF(inputPath, sel)
+	}
+	return nil, fmt.Errorf("-input must be a directory or a .pdf file, got %q", inputPath)
+}
+
+func sourcesFromDir(dir string) ([]sourceImage, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if !fileExts[ext] {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	out := make([]sourceImage, 0, len(names))
+	for _, n := range names {
+		p := filepath.Join(dir, n)
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sourceImage{
+			label: p,
+			raw:   raw,
+			ext:   strings.ToLower(filepath.Ext(n)),
+		})
+	}
+	return out, nil
+}
+
+func sourcesFromPDF(pdfPath string, pageSelection []string) ([]sourceImage, error) {
+	f, err := os.Open(pdfPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	base := filepath.Base(pdfPath)
+	var out []sourceImage
+	conf := model.NewDefaultConfiguration()
+	err = api.ExtractImages(f, pageSelection, func(img model.Image, _ bool, _ int) error {
+		if img.Reader == nil {
+			return nil
+		}
+		if img.Thumb || img.IsImgMask {
+			return nil
+		}
+		data, err := io.ReadAll(img.Reader)
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			return nil
+		}
+		ext := strings.ToLower(img.FileType)
+		if ext == "" {
+			ext = ".bin"
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		label := fmt.Sprintf("%s (page %d, obj %d, %s)", base, img.PageNr, img.ObjNr, img.Name)
+		out = append(out, sourceImage{label: label, raw: data, ext: ext})
+		return nil
+	}, conf)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no suitable embedded images found in %s (masks/thumbnails skipped)", pdfPath)
+	}
+	return out, nil
 }
 
 // bestA4PackA6Landscape picks A4 portrait or landscape to maximize non-overlapping
@@ -178,34 +291,13 @@ func bestA4PackA6Landscape(margin float64) (orient string, cols, rows int, pageW
 	return orient, cols, rows, pageW, pageH
 }
 
-func listImagePaths(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
+// preparePayload returns fpdf image type, bytes to embed, pixel dimensions after optional portrait→landscape rotation.
+// JPEG/PNG landscape rasters pass through without re-encoding when possible.
+func preparePayload(raw []byte, ext string, rotateLosslessPNG bool) (imgType string, data []byte, w, h int, err error) {
+	ext = strings.ToLower(ext)
+	if !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
 	}
-	var paths []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		ext := strings.ToLower(filepath.Ext(e.Name()))
-		if !exts[ext] {
-			continue
-		}
-		paths = append(paths, filepath.Join(dir, e.Name()))
-	}
-	sort.Strings(paths)
-	return paths, nil
-}
-
-// prepareForPDF returns image type, bytes, pixel size after optional portrait→landscape rotation.
-// Landscape JPEG/PNG pass through as original bytes (no re-encode).
-func prepareForPDF(path string, rotateLosslessPNG bool) (imgType string, data []byte, w, h int, err error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", nil, 0, 0, err
-	}
-	ext := strings.ToLower(filepath.Ext(path))
 
 	switch ext {
 	case ".jpg", ".jpeg":
@@ -237,8 +329,33 @@ func prepareForPDF(path string, rotateLosslessPNG bool) (imgType string, data []
 		return encodeRotatedLandscape(img, rotateLosslessPNG)
 
 	default:
-		return "", nil, 0, 0, fmt.Errorf("unsupported extension %q", ext)
+		img, _, derr := image.Decode(bytes.NewReader(raw))
+		if derr != nil {
+			return "", nil, 0, 0, fmt.Errorf("unsupported or corrupt format %s: %w", ext, derr)
+		}
+		b := img.Bounds()
+		pw, ph := b.Dx(), b.Dy()
+		if ph <= pw {
+			return encodeBitmapForPDF(img, rotateLosslessPNG)
+		}
+		return encodeRotatedLandscape(img, rotateLosslessPNG)
 	}
+}
+
+func encodeBitmapForPDF(img image.Image, usePNG bool) (imgType string, data []byte, w, h int, err error) {
+	b := img.Bounds()
+	w, h = b.Dx(), b.Dy()
+	var buf bytes.Buffer
+	if usePNG {
+		if err := png.Encode(&buf, img); err != nil {
+			return "", nil, 0, 0, err
+		}
+		return "png", buf.Bytes(), w, h, nil
+	}
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 100}); err != nil {
+		return "", nil, 0, 0, err
+	}
+	return "jpg", buf.Bytes(), w, h, nil
 }
 
 func encodeRotatedLandscape(img image.Image, usePNG bool) (imgType string, data []byte, w, h int, err error) {
